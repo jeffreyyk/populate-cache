@@ -1,0 +1,12 @@
+# Runtime artifacts - never commit
+artifacts-*.txt
+prepop-spec-*.json
+prepop-report-*.csv
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*~

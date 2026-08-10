@@ -1,0 +1,16 @@
+# Sample artifact list for --fromFile input.
+# One artifact path per line, repo-relative (no <repo>-cache/ prefix).
+# Lines starting with # are comments. Blank lines are ignored.
+
+# --- npm ---
+@babel/code-frame/-/code-frame-7.29.7.tgz
+eslint/-/eslint-8.57.0.tgz
+lodash/-/lodash-4.17.21.tgz
+yargs-parser/-/yargs-parser-21.1.1.tgz
+
+# --- Excluded from this run pending security review ---
+# some-vulnerable-package/-/some-vulnerable-package-1.0.0.tgz
+
+# --- Maven example ---
+# com/example/mylib/1.2.3/mylib-1.2.3.jar
+# com/example/mylib/1.2.3/mylib-1.2.3.pom
