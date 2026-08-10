@@ -272,21 +272,24 @@ prepopulate_one() {
   # Print "starting" line immediately so operator sees progress in real time
   printf "[%s]   ...   %s" "$(date '+%H:%M:%S')" "${rel_path}"
 
-  # Capture curl status cleanly. Do NOT use `|| echo "000"` — that concatenates
-  # with any partial status curl already wrote to stdout.
+  # Capture curl status cleanly.
+  # Guard against `set -e`: wrap the assignment in `if` so curl's non-zero
+  # exit (timeout, DNS, connection refused) doesn't kill the script.
   local status curl_err_file="/tmp/prepop_curl_err.$$"
-  local rc
-  status=$(curl -sS -o /dev/null -w "%{http_code}" \
-             "${AUTH_ARG[@]}" \
-             -X HEAD \
-             --connect-timeout "${connect_timeout}" \
-             "${JF_URL}${endpoint}" 2>"$curl_err_file")
-  rc=$?
+  local rc=0
+  if status=$(curl -sS -o /dev/null -w "%{http_code}" \
+                "${AUTH_ARG[@]}" \
+                -X HEAD \
+                --connect-timeout "${connect_timeout}" \
+                "${JF_URL}${endpoint}" 2>"$curl_err_file"); then
+    rc=0
+  else
+    rc=$?
+  fi
 
   local curl_err=""
   if [[ $rc -ne 0 ]]; then
     curl_err=$(tr '\n' ' ' < "$curl_err_file")
-    # If curl failed before printing anything, force 000
     [[ -z "$status" || ! "$status" =~ ^[0-9]{3}$ ]] && status="000"
   fi
   rm -f "$curl_err_file"
