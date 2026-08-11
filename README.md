@@ -183,11 +183,3 @@ curl -v -H "Authorization: Bearer <token>" \
 **Filter returns everything unfiltered** — The `.npm/*` metadata is now excluded automatically, but if you see registry docs (`.npm/*/package.json`) in the output, you're on a pre-fix version.
 
 **Docker repos** — This script targets file-based package types (npm, Maven, PyPI, NuGet, Generic). Docker needs manifest-level enumeration and `docker pull`-style fetching; see the reference cleanup script for the manifest pattern.
-
-## Related
-
-- **Cleanup script** (`CleanupScriptWithConditions.sh`) — inverse operation: delete artifacts by AQL criteria. Same auth/spec-file patterns.
-
-## License
-
-Internal PS tool. No external distribution.
