@@ -297,11 +297,11 @@ prepopulate_one() {
   # Overwrite the "..." line with the final status
   printf "\r[%s]   " "$(date '+%H:%M:%S')"
   case "$status" in
-    200) printf "OK    %s\n" "${rel_path}" ;;
-    403) printf "BLOCK %s  (Curation denied)\n" "${rel_path}" ;;
-    404) printf "MISS  %s  (not in upstream)\n" "${rel_path}" ;;
-    000) printf "FAIL  %s  (%s)\n" "${rel_path}" "${curl_err:-unknown error}" ;;
-    *)   printf "HTTP %s  %s\n" "${status}" "${rel_path}" ;;
+    200) printf "OK    [200]  %s\n" "${rel_path}" ;;
+    403) printf "BLOCK [403]  %s  (Curation denied)\n" "${rel_path}" ;;
+    404) printf "MISS  [404]  %s  (not in upstream)\n" "${rel_path}" ;;
+    000) printf "FAIL  [---]  %s  (%s)\n" "${rel_path}" "${curl_err:-unknown error}" ;;
+    *)   printf "      [%s]  %s\n" "${status}" "${rel_path}" ;;
   esac
 
   echo "${rel_path},${status}" >> "$report_csv"
