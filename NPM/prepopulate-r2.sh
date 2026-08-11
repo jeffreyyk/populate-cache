@@ -3,11 +3,24 @@
 # prepopulate-r2.sh
 # ------------------------------------------------------------------
 # Purpose:
-#   Two modes, both driven by jf CLI + AQL spec files:
-#     1. list        - List artifacts in R1's cache. Optional time filter.
-#     2. prepopulate - Trigger R2 to fetch each listed artifact from its
-#                      upstream, warming R2's cache and forcing Curation
-#                      to evaluate every one.
+#   Two subcommands:
+#     1. list        - Enumerate npm tarballs in R1's cache via AQL and
+#                      emit pkg@version pairs.
+#     2. prepopulate - Run `jf npm pack pkg@version` for each entry
+#                      through R2. Populates both the tarball and the
+#                      npm metadata (.npm/<pkg>/package.json) in R2's
+#                      cache without pulling transitive dependencies.
+#
+# Why `jf npm pack` instead of curl:
+#   - Curl HEAD on the tarball URL populates the tarball but NOT the
+#     .npm/<pkg>/package.json metadata document. Real npm clients hit
+#     both, and some Curation policies inspect the metadata.
+#   - `jf npm install` populates metadata + tarball, but also pulls
+#     all transitive dependencies, over-populating R2 with content
+#     R1 never had.
+#   - `jf npm pack pkg@version` hits both endpoints (metadata + tarball
+#     for the exact pinned version) and skips dependency resolution.
+#     Mirrors R1's cache shape exactly.
 #
 # Usage:
 #   ./prepopulate-r2.sh list \
@@ -18,10 +31,9 @@
 #       --serverid <id> --targetRepo <R2> \
 #       ( --sourceRepo <R1> [--downloadedWithin <dur>] [--createdWithin <dur>] \
 #       | --fromFile <PATH> ) \
-#       [--resolveVia remote|virtual] [--virtualRepo <V1>] [--dry-run]
+#       [--dry-run] [--keep-work-dir]
 #
-# Duration strings match AQL: 1d, 1w, 6mo, 1y (uses $before internally,
-# inverted with $not for "within" semantics via $gt ISO date).
+# Duration strings: 1d, 1w, 6mo, 1y
 # ------------------------------------------------------------------
 
 set -euo pipefail
@@ -33,13 +45,12 @@ targetRepo=""
 downloadedWithin=""
 createdWithin=""
 fromFile=""
-resolveVia="remote"
-virtualRepo=""
 dryrun="false"
+keepWorkDir="false"
 spec_file="prepop-spec-$$.json"
 out_list="artifacts-$$.txt"
 report_csv=""
-connect_timeout="10"
+NPM_WORK_DIR=""
 
 # ---------- Utility ----------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -53,35 +64,22 @@ Usage:
   $0 prepopulate --serverid <id> --targetRepo <R2>
      ( --sourceRepo <R1> [--downloadedWithin <dur>] [--createdWithin <dur>]
      | --fromFile <PATH> )
-     [--resolveVia remote|virtual] [--virtualRepo <V1>] [--dry-run]
-     [--connect-timeout <sec>]
+     [--dry-run] [--keep-work-dir]
 
-Duration format: 1d, 1w, 6mo, 1y (same as your cleanup script).
-
-Timeouts (prepopulate only):
-  --connect-timeout <sec>  Max time to establish TCP+TLS connection to R2.
-                           Default: 10s. Trips fast if R2 unreachable.
-                           No ceiling on transfer once connected — R2 fetches
-                           run as long as the upstream needs.
+Flags:
+  --serverid <id>          JFrog CLI server ID.
+  --sourceRepo <R1>        npm remote whose cache we enumerate.
+  --targetRepo <R2>        npm remote to warm.
+  --fromFile <PATH>        Read pkg@version list from a file (one per line, # for comments).
+  --downloadedWithin <dur> AQL filter: stat.downloaded within duration (e.g. 1y).
+  --createdWithin <dur>    AQL filter: created within duration.
+  --dry-run                Print jf npm pack commands, do not execute.
+  --keep-work-dir          Do not delete the scratch npm work dir on exit
+                           (useful for debugging).
 
 Examples:
-  # List everything in R1
-  $0 list --serverid mytenant --sourceRepo npm-remote
-
-  # List npm packages downloaded in the last year
-  $0 list --serverid mytenant --sourceRepo npm-remote --downloadedWithin 1y
-
-  # Pre-populate R2 from R1 (last year of activity), dry run first
-  $0 prepopulate --serverid mytenant --targetRepo npm-remote-new \\
-       --sourceRepo npm-remote --downloadedWithin 1y --dry-run
-
-  # Pre-populate R2 from a reviewed file
-  $0 prepopulate --serverid mytenant --targetRepo npm-remote-new \\
-       --fromFile reviewed-artifacts.txt
-
-  # Same but through the virtual (dress rehearsal)
-  $0 prepopulate --serverid mytenant --targetRepo npm-remote-new \\
-       --fromFile reviewed.txt --resolveVia virtual --virtualRepo npm-virtual
+  $0 list --serverid sum2 --sourceRepo npm-remote --downloadedWithin 1y
+  $0 prepopulate --serverid sum2 --targetRepo npm-remote2 --fromFile pkgs.txt
 EOF
   exit 1
 }
@@ -98,86 +96,34 @@ while [[ $# -gt 0 ]]; do
     --downloadedWithin)  downloadedWithin="$2"; shift 2 ;;
     --createdWithin)     createdWithin="$2"; shift 2 ;;
     --fromFile)          fromFile="$2"; shift 2 ;;
-    --resolveVia)        resolveVia="$2"; shift 2 ;;
-    --virtualRepo)       virtualRepo="$2"; shift 2 ;;
     --dry-run)           dryrun="true"; shift ;;
-    --connect-timeout)   connect_timeout="$2"; shift 2 ;;
+    --keep-work-dir)     keepWorkDir="true"; shift ;;
     --help|-h)           usage ;;
     *) log "ERROR: unknown flag $1"; usage ;;
   esac
 done
 
 # ---------- Preflight ----------
-if [[ -z "$serverid" ]]; then
-  log "ERROR: --serverid is required"
-  usage
-fi
-
+[[ -z "$serverid" ]] && { log "ERROR: --serverid is required"; usage; }
 if ! jf c show "$serverid" >/dev/null 2>&1; then
   log "ERROR: server ID '$serverid' not configured. Run 'jf c add' first."
   exit 1
 fi
 
-# Extract URL + access token from the configured server, ONCE.
-# jf c export emits base64-encoded JSON; decode and pull the fields we need.
-server_json=$(jf c export "$serverid" 2>/dev/null | base64 --decode 2>/dev/null || true)
-if [[ -z "$server_json" ]]; then
-  log "ERROR: could not export server config for '$serverid'"
-  exit 1
-fi
-
-JF_URL=$(echo "$server_json" | jq -r '.url // .artifactoryUrl // empty' | sed 's|/$||')
-JF_TOKEN=$(echo "$server_json" | jq -r '.accessToken // empty')
-JF_USER=$(echo "$server_json" | jq -r '.user // empty')
-JF_PASS=$(echo "$server_json" | jq -r '.password // empty')
-
-if [[ -z "$JF_URL" ]]; then
-  log "ERROR: could not parse artifactory URL from server config"
-  exit 1
-fi
-
-# Build the auth arg once for reuse
-if [[ -n "$JF_TOKEN" ]]; then
-  AUTH_ARG=(-H "Authorization: Bearer ${JF_TOKEN}")
-elif [[ -n "$JF_USER" && -n "$JF_PASS" ]]; then
-  AUTH_ARG=(-u "${JF_USER}:${JF_PASS}")
-else
-  log "ERROR: no credentials found in server config"
-  exit 1
-fi
-
-# Ensure URL points at the /artifactory root
-[[ "$JF_URL" != */artifactory ]] && JF_URL="${JF_URL}/artifactory"
-
-# ---------- AQL builder ----------
-# NOTE: AQL "$before" matches items OLDER than the duration.
-#       For "within the last <dur>" semantics we would need "$last" which AQL
-#       does not expose. Instead we invert client-side: list all first, then
-#       filter by ISO cutoff on stat.downloaded / created returned in results.
-# But to keep the query itself narrow (fewer results returned), we use $before
-# on the OPPOSITE field to prune obvious matches, then a jq post-filter to
-# enforce the "within" semantics precisely.
-#
-# Actually simplest: use jq to post-filter on the ISO timestamp AQL returns.
-
-# Compute ISO cutoff for a duration like 1y, 6mo, 1w, 1d, 30d
+# ---------- AQL listing ----------
 iso_cutoff_for_duration() {
   local dur="$1"
   local n unit
-  # split into number + unit
   n=$(echo "$dur" | sed -E 's/([0-9]+).*/\1/')
   unit=$(echo "$dur" | sed -E 's/[0-9]+//')
-
   local days
   case "$unit" in
     d)  days=$n ;;
     w)  days=$((n * 7)) ;;
     mo) days=$((n * 30)) ;;
     y)  days=$((n * 365)) ;;
-    *) log "ERROR: unknown duration unit '$unit' (use d, w, mo, y)"; exit 1 ;;
+    *) log "ERROR: unknown duration unit '$unit'"; exit 1 ;;
   esac
-
-  # portable date arithmetic
   if date -u -d "${days} days ago" +"%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1; then
     date -u -d "${days} days ago" +"%Y-%m-%dT%H:%M:%SZ"
   else
@@ -185,32 +131,21 @@ iso_cutoff_for_duration() {
   fi
 }
 
-# Write an AQL spec file that lists R1 cache contents
 write_spec() {
   local repo_cache="${sourceRepo}-cache"
-
-  # Base conditions
   local conditions="{ \"\$and\": [ { \"repo\": \"${repo_cache}\" }, { \"type\": \"file\" }"
 
-  # Exclude package-manager metadata that isn't a real artifact:
-  #   - npm registry documents under .npm/ (package.json files)
-  #   - checksum sidecars (.sha1, .sha256, .md5) - regenerated on cache
-  #   - Maven maven-metadata.xml (regenerated by indexer)
-  #   - manifest.json (Docker manifests, handled differently)
+  # Only match actual .tgz tarballs; exclude metadata, checksums, and
+  # anything under .npm/ (registry documents, not artifacts).
+  conditions+=", { \"name\": { \"\$match\": \"*.tgz\" } }"
   conditions+=", { \"path\": { \"\$nmatch\": \".npm/*\" } }"
-  conditions+=", { \"name\": { \"\$nmatch\": \"*.sha1\" } }"
-  conditions+=", { \"name\": { \"\$nmatch\": \"*.sha256\" } }"
-  conditions+=", { \"name\": { \"\$nmatch\": \"*.md5\" } }"
-  conditions+=", { \"name\": { \"\$nmatch\": \"maven-metadata.xml*\" } }"
 
-  # Time filters - $gt with ISO cutoff (proven to work with jf rt s --spec)
   if [[ -n "$downloadedWithin" ]]; then
     local cutoff
     cutoff=$(iso_cutoff_for_duration "$downloadedWithin")
     conditions+=", { \"stat.downloaded\": { \"\$gt\": \"${cutoff}\" } }"
     log "Filter: stat.downloaded > ${cutoff} (within ${downloadedWithin})"
   fi
-
   if [[ -n "$createdWithin" ]]; then
     local cutoff
     cutoff=$(iso_cutoff_for_duration "$createdWithin")
@@ -219,120 +154,147 @@ write_spec() {
   fi
 
   conditions+=" ] }"
-
   cat > "$spec_file" <<EOF
-{
-  "files": [
-    {
-      "aql": {
-        "items.find": ${conditions}
-      }
-    }
-  ]
-}
+{ "files": [ { "aql": { "items.find": ${conditions} } } ] }
 EOF
-
-  log "AQL spec written: $spec_file"
 }
 
-# Run the search - AQL returns .path (folder) and .name (filename) separately.
-# We join them and strip the repo-cache prefix so the output is ready to feed
-# straight into the R2 fetch step.
+# Convert AQL result to pkg@version.
+#   path shape: eslint/-/eslint-8.57.0.tgz            -> eslint@8.57.0
+#   path shape: @babel/code-frame/-/code-frame-7.29.7.tgz -> @babel/code-frame@7.29.7
+#
+# jf rt s returns .path with the tarball filename appended and the
+# <repo>-cache/ prefix in front. We strip both, then split on "/-/".
 run_search() {
-  log "Searching ${sourceRepo}-cache..."
+  log "Searching ${sourceRepo}-cache for tarballs..."
   jf rt s --spec="$spec_file" --server-id="$serverid" \
-    | jq -r --arg prefix "${sourceRepo}-cache/" \
-        '.[] | .path | sub("^" + $prefix; "")' \
+    | jq -r --arg prefix "${sourceRepo}-cache/" '
+        .[] | .path
+        | sub("^" + $prefix; "")
+        | capture("(?<pkg>.+)/-/(?<name>[^/]+)\\.tgz$")
+        | .pkg as $pkg
+        | (.name | capture("(?<n>.+)-(?<v>[0-9][^-]*.*)$")) as $nv
+        | "\($pkg)@\($nv.v)"
+      ' \
+    | sort -u \
     > "$out_list"
   local count
   count=$(wc -l < "$out_list" | tr -d ' ')
-  log "Found ${count} artifacts. List: ${out_list}"
+  log "Found ${count} pkg@version entries. List: ${out_list}"
 }
 
-# ---------- Pre-populate ----------
-# Trigger R2 to fetch each listed artifact via HEAD (fetch+cache on Artifactory
-# side, no payload to client). Uses jf rt curl so serverid handles auth+URL.
-prepopulate_one() {
-  local rel_path="$1"    # already repo-relative from run_search
-
-  # Determine target endpoint
-  local endpoint
-  if [[ "$resolveVia" == "virtual" ]]; then
-    endpoint="/${virtualRepo}/${rel_path}"
+# ---------- npm operations ----------
+setup_npm_work_dir() {
+  NPM_WORK_DIR=$(mktemp -d)
+  if [[ "$keepWorkDir" != "true" ]]; then
+    trap 'rm -rf "$NPM_WORK_DIR"' EXIT
   else
-    endpoint="/${targetRepo}/${rel_path}"
+    trap 'log "Scratch dir preserved: $NPM_WORK_DIR"' EXIT
   fi
 
+  log "Configuring jf npm resolver in scratch dir: ${NPM_WORK_DIR}"
+  if ! ( cd "$NPM_WORK_DIR" && \
+         jf npmc --repo-resolve="$targetRepo" \
+                 --server-id-resolve="$serverid" \
+                 >/dev/null 2>&1 ); then
+    # Newer jf CLI uses jf npm-config
+    if ! ( cd "$NPM_WORK_DIR" && \
+           jf npm-config --repo-resolve="$targetRepo" \
+                         --server-id-resolve="$serverid" \
+                         >/dev/null 2>&1 ); then
+      log "ERROR: could not configure jf npm resolver."
+      log "       Check 'jf npmc --help' or 'jf npm-config --help'."
+      exit 1
+    fi
+  fi
+}
+
+# Run `jf npm pack pkg@version` in the scratch dir.
+# Pack fetches metadata + tarball through R2 without pulling deps.
+prepopulate_one() {
+  local pkgver="$1"
+
   if [[ "$dryrun" == "true" ]]; then
-    log "  DRY   HEAD ${JF_URL}${endpoint}"
-    echo "${rel_path},DRY" >> "$report_csv"
+    log "  DRY   jf npm pack ${pkgver}"
+    echo "${pkgver},DRY" >> "$report_csv"
     return
   fi
 
-  # Print "starting" line immediately so operator sees progress in real time
-  printf "[%s]   ...   %s" "$(date '+%H:%M:%S')" "${rel_path}"
+  printf "[%s]   ...   %s" "$(date '+%H:%M:%S')" "${pkgver}"
 
-  # Capture curl status cleanly.
-  # Guard against `set -e`: wrap the assignment in `if` so curl's non-zero
-  # exit (timeout, DNS, connection refused) doesn't kill the script.
-  local status curl_err_file="/tmp/prepop_curl_err.$$"
+  local npm_out_file="/tmp/prepop_npm_out.$$"
   local rc=0
-  if status=$(curl -sS -o /dev/null -w "%{http_code}" \
-                "${AUTH_ARG[@]}" \
-                -X HEAD \
-                --connect-timeout "${connect_timeout}" \
-                "${JF_URL}${endpoint}" 2>"$curl_err_file"); then
+  if ( cd "$NPM_WORK_DIR" && jf npm pack "$pkgver" ) >"$npm_out_file" 2>&1; then
     rc=0
   else
     rc=$?
   fi
 
-  local curl_err=""
-  if [[ $rc -ne 0 ]]; then
-    curl_err=$(tr '\n' ' ' < "$curl_err_file")
-    [[ -z "$status" || ! "$status" =~ ^[0-9]{3}$ ]] && status="000"
+  local status
+  if [[ $rc -eq 0 ]]; then
+    status="200"
+  elif grep -qi "404\|not found\|no matching version\|is not in the npm registry" "$npm_out_file"; then
+    status="404"
+  elif grep -qi "401\|403\|forbidden\|unauthorized\|EAUTH\|denied" "$npm_out_file"; then
+    status="403"
+  else
+    status="FAIL"
   fi
-  rm -f "$curl_err_file"
 
-  # Overwrite the "..." line with the final status
+  local err_line
+  err_line=$(tail -1 "$npm_out_file" | tr -d '\n' | head -c 120)
+  rm -f "$npm_out_file"
+
+  # Remove the .tgz file left in the work dir so disk usage doesn't grow
+  find "$NPM_WORK_DIR" -maxdepth 1 -name '*.tgz' -delete 2>/dev/null || true
+
   printf "\r[%s]   " "$(date '+%H:%M:%S')"
   case "$status" in
-    200) printf "OK    [200]  %s\n" "${rel_path}" ;;
-    403) printf "BLOCK [403]  %s  (Curation denied)\n" "${rel_path}" ;;
-    404) printf "MISS  [404]  %s  (not in upstream)\n" "${rel_path}" ;;
-    000) printf "FAIL  [---]  %s  (%s)\n" "${rel_path}" "${curl_err:-unknown error}" ;;
-    *)   printf "      [%s]  %s\n" "${status}" "${rel_path}" ;;
+    200)  printf "OK    [200]  %s\n" "${pkgver}" ;;
+    403)  printf "BLOCK [403]  %s  (Curation denied or auth failed)\n" "${pkgver}" ;;
+    404)  printf "MISS  [404]  %s  (not in upstream)\n" "${pkgver}" ;;
+    FAIL) printf "FAIL  [---]  %s  (%s)\n" "${pkgver}" "${err_line}" ;;
   esac
 
-  echo "${rel_path},${status}" >> "$report_csv"
+  echo "${pkgver},${status}" >> "$report_csv"
 }
 
 prepopulate_all() {
   local input_list="$1"
   report_csv="prepop-report-${targetRepo}-$(date +%Y%m%d-%H%M%S).csv"
-  echo "artifact_path,http_status" > "$report_csv"
+  echo "pkg_version,status" > "$report_csv"
 
-  [[ "$dryrun" == "true" ]] && log "DRY RUN - no requests will hit R2"
-  log "Pre-populating ${targetRepo} via ${resolveVia}..."
+  [[ "$dryrun" == "true" ]] && log "DRY RUN - no jf npm pack commands will run"
+
+  # Preflight npm (required by jf npm pack)
+  if [[ "$dryrun" != "true" ]] && ! command -v npm >/dev/null 2>&1; then
+    log "ERROR: 'npm' binary not found on PATH. Install Node.js first."
+    exit 1
+  fi
+
+  setup_npm_work_dir
+  log "Pre-populating ${targetRepo} via 'jf npm pack'..."
 
   local count=0
-  while IFS= read -r ARTIFACT; do
-    [[ -z "$ARTIFACT" ]] && continue
-    [[ "$ARTIFACT" == \#* ]] && continue      # allow # comments in file input
-    prepopulate_one "$ARTIFACT"
+  while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+    LINE="${LINE%$'\r'}"
+    LINE="${LINE#"${LINE%%[![:space:]]*}"}"
+    LINE="${LINE%"${LINE##*[![:space:]]}"}"
+    [[ -z "$LINE" ]] && continue
+    [[ "$LINE" == \#* ]] && continue
+    prepopulate_one "$LINE"
     count=$((count + 1))
   done < "$input_list"
 
-  log "Complete. ${count} artifacts processed. Report: ${report_csv}"
+  log "Complete. ${count} pkg@version entries processed. Report: ${report_csv}"
   log "Summary:"
-  awk -F',' 'NR>1 {c[$2]++} END {for (s in c) printf "  HTTP %s : %d\n", s, c[s]}' \
+  awk -F',' 'NR>1 {c[$2]++} END {for (s in c) printf "  %-6s : %d\n", s, c[s]}' \
     "$report_csv" | sort
 }
 
 # ---------- Subcommands ----------
 cmd_list() {
   [[ -z "$sourceRepo" ]] && { log "ERROR: --sourceRepo required"; usage; }
-
   log "=== List mode ==="
   log "Source: ${sourceRepo}"
   write_spec
@@ -344,20 +306,15 @@ cmd_prepopulate() {
   [[ -z "$targetRepo" ]] && { log "ERROR: --targetRepo required"; usage; }
 
   if [[ -n "$sourceRepo" && -n "$fromFile" ]]; then
-    log "ERROR: --sourceRepo and --fromFile are mutually exclusive"
-    exit 1
+    log "ERROR: --sourceRepo and --fromFile are mutually exclusive"; exit 1
   fi
   if [[ -z "$sourceRepo" && -z "$fromFile" ]]; then
-    log "ERROR: one of --sourceRepo or --fromFile is required"
-    usage
-  fi
-  if [[ "$resolveVia" == "virtual" && -z "$virtualRepo" ]]; then
-    log "ERROR: --resolveVia virtual requires --virtualRepo"
-    exit 1
+    log "ERROR: one of --sourceRepo or --fromFile is required"; usage
   fi
 
   log "=== Prepopulate mode ==="
-  log "Target: ${targetRepo}   Resolve via: ${resolveVia}   Dry-run: ${dryrun}"
+  log "Target: ${targetRepo}"
+  log "Dry-run: ${dryrun}"
 
   local input_list
   if [[ -n "$sourceRepo" ]]; then
