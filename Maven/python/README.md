@@ -1,86 +1,99 @@
-# Maven scripts — Python port
+# Maven — R1 → R2 migration scripts
 
-Python equivalents of the bash scripts in `../`:
+Bash and Python scripts to enumerate a source Maven remote (R1), pre-populate the target Curation-enabled remote (R2), and check what still exists upstream.
 
-- `prepopulate-r2-maven.py` — enumerate R1's cached Maven artifacts, HEAD each through R2 to warm the cache and trigger Curation.
-- `check-upstream-maven.py` — HEAD each Maven coordinate directly against upstream to determine what's still there vs. genuinely missing.
-- `prepop_lib.py` — shared utility library (imported by the two scripts above; also duplicated in `../../Docker/python/` for self-containment).
+- `prepopulate-r2-maven.sh` / `python/prepopulate-r2-maven.py` — list R1's cached coords, then HEAD each `.jar` and `.pom` through R2 to warm the cache and trigger Curation.
+- `check-upstream-maven.sh` / `python/check-upstream-maven.py` — HEAD each coord directly against upstream (usually Maven Central) to distinguish "gone from upstream" from "gone from R1".
 
-Same CLI flags as the bash originals in the parent folder, same output shape (CSV columns, log format), same behavior. You can swap `.sh` for `.py` in cron jobs or wrappers without changing anything else.
+Bash and Python are functionally equivalent — same CLI flags, same output shape (CSV columns, log format), same behavior. Python adds `--concurrency N` for parallel HEAD requests.
 
 ## Prerequisites
 
-- **Python 3.8+** — uses dataclasses. Verify: `python3 -V`
-- **`requests` library** — for HTTP calls. Install: `pip install requests` (or `pip3`)
-- **JFrog CLI (`jf`)** — same as bash version; the Python scripts shell out to `jf` for AQL search and config export. Verify: `jf --version`
-- **A configured server ID** — same as bash. Verify: `jf c show <your-serverid>`
+- **`jf` CLI** — configured with a server ID. Verify: `jf c show <serverid>`
+- **`jq` and `curl`** — on PATH. Verify: `which jq curl`
+- **Python 3.8+** (Python mode only) — `python3 -V`
+- **`requests` library** (Python mode only) — `pip install requests`
 
-Quick sanity check that everything's in place:
+Quick sanity check:
 
 ```bash
-python3 -c "import requests; print('requests', requests.__version__)"
 jf c show psblr
+which jq curl
+python3 -c "import requests; print('requests', requests.__version__)"   # Python mode
 ```
 
-## Quick start
+## Quick start (bash)
 
 ```bash
-cd Maven/python/
-
 # --- LIST: enumerate R1's cached coordinates ---
-python3 prepopulate-r2-maven.py list \
-  --serverid psblr --sourceRepo testpopulate-maven
+./prepopulate-r2-maven.sh list \
+  --serverid psblr --sourceRepo sum-cba-maven-remote
 # → maven-artifacts-<timestamp>.txt
 
 # --- PREPOPULATE: dry-run first to see what would be HEAD'd ---
-python3 prepopulate-r2-maven.py prepopulate \
-  --serverid psblr --targetRepo testpopulate-maven2 \
+./prepopulate-r2-maven.sh prepopulate \
+  --serverid psblr --targetRepo testpopulate-maven \
   --fromFile maven-artifacts-*.txt --dry-run
 
 # --- Real run ---
-python3 prepopulate-r2-maven.py prepopulate \
-  --serverid psblr --targetRepo testpopulate-maven2 \
+./prepopulate-r2-maven.sh prepopulate \
+  --serverid psblr --targetRepo testpopulate-maven \
   --fromFile maven-artifacts-*.txt
 
 # --- CHECK-UPSTREAM: verify which coords still exist on upstream ---
-python3 check-upstream-maven.py \
-  --serverid psblr --sourceRepo testpopulate-maven \
+./check-upstream-maven.sh \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
   --fromFile maven-artifacts-*.txt
+```
 
-# --- Verbose mode adds per-file timing ---
+## Quick start (Python, with concurrency)
+
+```bash
+cd python/
+
+# --- LIST ---
+python3 prepopulate-r2-maven.py list \
+  --serverid psblr --sourceRepo sum-cba-maven-remote
+
+# --- PREPOPULATE: dry-run ---
 python3 prepopulate-r2-maven.py prepopulate \
-  --serverid psblr --targetRepo testpopulate-maven2 \
-  --fromFile maven-artifacts-*.txt -v
+  --serverid psblr --targetRepo testpopulate-maven \
+  --fromFile maven-artifacts-*.txt --dry-run
+
+# --- Real run, concurrent ---
+python3 prepopulate-r2-maven.py prepopulate \
+  --serverid psblr --targetRepo testpopulate-maven \
+  --fromFile maven-artifacts-*.txt --concurrency 8
+
+# --- CHECK-UPSTREAM, concurrent ---
+python3 check-upstream-maven.py \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt --concurrency 8
 ```
 
-## Flags (identical to bash version)
-
-`prepopulate-r2-maven.py`:
+## Coordinate format
 
 ```
-list         --serverid --sourceRepo [--downloadedWithin] [--createdWithin]
-             [--includeSources] [--includeJavadoc]
-
-prepopulate  --serverid --targetRepo
-             ( --sourceRepo [--downloadedWithin] [--createdWithin]
-             | --fromFile <path> )
-             [--includeSources] [--includeJavadoc]
-             [--withMetadata] [--dry-run] [--verbose]
-             [--connect-timeout <sec>]
+groupId:artifactId:version               regular artifact (fetch .jar + .pom)
+groupId:artifactId:version:pom           POM-only (BOMs, parent poms) — .pom only
 ```
 
-`check-upstream-maven.py`:
+The `:pom` suffix is added automatically by `list` when R1's cache only contains a `.pom`. Prepopulate and check-upstream respect it and skip the `.jar` HEAD for those.
 
-```
---serverid --sourceRepo
-( --fromFile <path> | [--downloadedWithin] [--createdWithin] )
-[--connect-timeout <sec>] [--verbose]
-```
+## Concurrency (Python only)
 
-Duration format for `--downloadedWithin`/`--createdWithin`: `1d`, `1w`, `6mo`, `1y`.
+Both Python scripts accept `--concurrency N` (default 8). HEAD requests are I/O-bound and gain 5-10x speedup with `--concurrency 8`. Results appear in completion order (not input order) — normal for concurrent code. A progress counter `[X/N]` is on each result line, and the elapsed time is printed at completion.
 
-See the top-level docs in `../` for full flag semantics and output shape:
-- [`../prepopulate-r2-maven.md`](../prepopulate-r2-maven.md)
-- [`../check-upstream-maven.md`](../check-upstream-maven.md)
+Recommended `--concurrency`:
+- Maven Central: `8-16`
+- Sonatype OSS: `4-8`
+- Private Nexus / Artifactory: `4-8` (respect internal infra)
 
-Everything documented there applies to these Python versions too — the CLI is the same.
+If you see `429` responses or connection resets, drop the concurrency.
+
+## Reference
+
+- [`prepopulate-r2-maven.md`](./prepopulate-r2-maven.md) — full prepopulate details
+- [`check-upstream-maven.md`](./check-upstream-maven.md) — full check-upstream details
+- [`python/README.md`](./python/README.md) — Python-specific setup notes
+- [`../README.md`](../README.md) — top-level index of all package types

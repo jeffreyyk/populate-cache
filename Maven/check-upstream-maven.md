@@ -1,134 +1,183 @@
-# check-upstream.sh
+# check-upstream-maven
 
-Detect artifacts that have been removed from the upstream registry.
+Companion to [prepopulate-r2-maven](./prepopulate-r2-maven.md). Given a list of Maven coordinates, HEAD each expected file (`.jar` and/or `.pom`) directly against the upstream URL configured on R1. Available as both a bash script (`check-upstream-maven.sh`) and a Python port (`python/check-upstream-maven.py`) with concurrency.
 
-Given a list of artifact paths (from a file or from AQL against a remote repo's cache), the script tests each one against the upstream URL configured on that remote. Anything the upstream no longer has returns 404 — and those are the artifacts that need [rescue-local remediation](./README.md#the-404-case--rescue-local-remediation) before an R1 → R2 migration cutover, because R2 won't be able to fetch what upstream doesn't have anymore.
+Emits a report of statuses plus a text file listing only the missing ones, ready to feed into rescue-local remediation.
 
-Companion script to [prepopulate-r2.sh](./README.md).
+## What it does
 
-## When to run this
+Reads the upstream URL from R1's config, then for each coord:
 
-- **Before pre-populating R2** — to know which artifacts will fail cleanly at pre-populate time vs. which ones need to be rescued into a local repo instead.
-- **Ad-hoc auditing** — to check whether specific packages your teams depend on still exist upstream (useful when a security advisory unpublishes something and you need to know the blast radius).
+```
+HEAD <upstream>/<groupPath>/<artifactId>/<version>/<artifactId>-<version>.pom
+HEAD <upstream>/<groupPath>/<artifactId>/<version>/<artifactId>-<version>.jar   (unless POM-only)
+```
 
-## How it works
+Uses `-sSLI` (silent, follow redirects, HEAD). Maven Central and Sonatype OSS both redirect to CDNs so `-L` is required. `-I` (rather than `-X HEAD`) prevents Content-Length-driven stalls we hit historically.
 
-1. Reads the source repo config via `jf rt curl -X GET /api/repositories/<repo>` and extracts the upstream `url` field.
-2. For each artifact path in the input list, issues `curl -I -L` against `<upstream_url>/<artifact_path>`.
-3. Records the HTTP status per artifact.
-4. Writes two files: the full CSV report and a filtered plain-text list of just the 404s.
-
-Nothing is downloaded — only HTTP headers are exchanged. Bandwidth per artifact is a few kilobytes regardless of package size.
+Per-coord status is the rollup of per-file results: worst wins (FAIL > 403 > 404 > 200).
 
 ## Prerequisites
 
-- `jf` CLI configured with a server ID that has read access to the source repo's config.
-- `jq` for JSON parsing.
-- `curl`.
-- Direct network egress to the upstream registry (e.g. `registry.npmjs.org`, `pypi.org`, `repo1.maven.org`).
-
-If your workstation is behind a corp proxy, either set `HTTPS_PROXY` in the environment or run the script from a host that has direct upstream access.
+- **`jf` CLI** — configured with a server ID. Verify: `jf c show <serverid>`
+- **`jq` and `curl`** — on PATH
+- **Python 3.8+ and `requests`** (Python mode only) — `pip install requests`
 
 ## Quick start
 
+**Bash:**
 ```bash
-# Check a pre-built list against the R1 upstream
-./check-upstream.sh --serverid sum2 --sourceRepo npm-remote --fromFile artifacts.txt
+# Using an existing coord list
+./check-upstream-maven.sh \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt
 
-# Check everything R1 has cached in the last year of activity
-./check-upstream.sh --serverid sum2 --sourceRepo npm-remote --downloadedWithin 1y
+# Auto-enumerate from R1
+./check-upstream-maven.sh \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --downloadedWithin 1y
 
-# Verbose mode - show URLs and per-request timing
-./check-upstream.sh --serverid sum2 --sourceRepo npm-remote --fromFile artifacts.txt -v
+# Verbose timing (dns/tls/ttfb/total per file)
+./check-upstream-maven.sh \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt -v
 ```
 
-## Flag reference
+**Python (with concurrency):**
+```bash
+cd python/
 
-| Flag | Required | Description |
-|---|---|---|
-| `--serverid <id>` | yes | JFrog CLI server ID |
-| `--sourceRepo <name>` | yes | Remote repo whose upstream URL we test against |
-| `--fromFile <path>` | one of | Read artifact list from a file (one path per line, `#` for comments) |
-| `--downloadedWithin <dur>` | one of | AQL against the repo's cache with `stat.downloaded` filter |
-| `--createdWithin <dur>` | no | Alternative time filter on `created` |
-| `--connect-timeout <sec>` | no | TCP+TLS connect timeout. Default 10s. |
-| `--verbose`, `-v` | no | Print URL and per-request curl timing (dns / tls / ttfb / total) |
+python3 check-upstream-maven.py \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt --concurrency 8
+```
 
-**Duration format**: `1d`, `1w`, `6mo`, `1y`.
+## Flags
 
-**Input file format**: one artifact path per line, repo-relative (no `<repo>-cache/` prefix). Lines starting with `#` and blank lines are ignored. Trailing `\r` from Windows-edited files is stripped automatically.
+```
+--serverid <id>             JFrog CLI server ID
+--sourceRepo <repo>         R1 Maven remote (only used to read upstream URL)
+--fromFile <path>           Read coord list from file (mutually exclusive with time filters)
+--downloadedWithin <dur>    AQL filter on stat.downloaded (e.g. 1y, 6mo)
+--createdWithin <dur>       Additional AQL filter on created
+--connect-timeout <sec>     TCP+TLS connect timeout (default 10s)
+--verbose, -v               Per-file phase timing
+--concurrency N             Python only: parallel HEAD workers (default 8)
+```
+
+Duration format: `1d`, `1w`, `6mo`, `1y`.
+
+Input file format: one coord per line. Lines starting with `#` and blank lines are ignored. Trailing `\r` is stripped automatically.
+
+## Coordinate format
+
+```
+groupId:artifactId:version           regular artifact (HEAD .jar + .pom)
+groupId:artifactId:version:pom       POM-only (BOMs, parent poms) — HEAD .pom only
+```
+
+The `:pom` suffix tells the script to skip the `.jar` HEAD, so BOMs don't show misleading `jar=404` results.
 
 ## Output files
 
-Two files land in the current directory:
+- **`upstream-check-maven-<repo>-<timestamp>.csv`** — full per-file report. Columns: `coord,artifact_type,upstream_status`. One row per file.
+- **`upstream-missing-maven-<repo>-<timestamp>.txt`** — one coord per line, only entries where any expected file came back 404. Deleted automatically if empty.
 
-- **`upstream-check-<repo>-<timestamp>.csv`** — full CSV report. Columns: `artifact_path,upstream_status`.
-- **`upstream-missing-<repo>-<timestamp>.txt`** — plain text list of just the 404s, one path per line. Only created if there are missing artifacts. Ready to feed straight into the rescue-local step.
-
-Summary is also printed at the end:
+Summary printed at the end:
 
 ```
-HTTP 200 : 847
-HTTP 404 :  12
+Summary (by artifact_type + status):
+  jar/200      : 823
+  jar/404      : 3
+  pom/200      : 845
+  pom/404      : 3
+3 coordinate(s) with at least one 404 file: upstream-missing-maven-<ts>.txt
 ```
+
+The per-file breakdown helps triage: a MISS on the jar but OK on the pom means the artifact was renamed upstream but the pom is still there; a MISS on both is a hard 404.
 
 ## Interpreting results
 
-| Status | Label | Meaning | Action |
-|---|---|---|---|
-| 200 | `OK` | Still available upstream | Nothing to do — R2 will fetch it cleanly. |
-| 404 | `MISS` | Removed from upstream | Feed into rescue-local remediation. |
-| 401 / 403 | `AUTH` | Upstream requires auth | Upstream is private; anonymous check can't confirm. Either provide creds (out of scope for this script) or rely on R1's cache as ground truth. |
-| 000 | `FAIL` | Network error, timeout, DNS failure | Check network connectivity, retry. `--verbose` shows the underlying curl error. |
-| Other | `[NNN]` | Unusual status | Investigate case by case — 5xx from upstream, 429 rate limit, redirect loops. |
+Per-coord rollup:
 
-## Verbose mode
+| Console label | Meaning | Action |
+|---|---|---|
+| `OK    [200]` | All expected files on upstream | Nothing to do |
+| `AUTH  [401/403]` | Upstream requires auth | Check R1's upstream credentials |
+| `MISS  [404]` | At least one expected file missing | Feed into rescue-local remediation |
+| `FAIL  [---]` | Network / timeout / connection error | Retry, check network path |
 
-`-v` adds two extra lines per artifact:
+Per-file detail lives in the CSV — the console rollup is the "worst status" across files for that coord.
+
+## Concurrency (Python only)
+
+`--concurrency N` (default 8) enables parallel HEAD workers. Simple index responses are small and cached at CDN edges, so speedup is roughly linear up to `--concurrency 16` for Maven Central.
+
+Recommended values:
+- Maven Central: `8-16`
+- Sonatype OSS: `4-8`
+- Private Nexus / Artifactory: `4-8`
+
+Progress counter `[X/N]` appears on each result line; elapsed time at completion.
+
+## Rescue-local remediation
+
+For coords flagged 404:
+
+1. Create a Maven rescue local repo (e.g. `<prefix>-maven-rescue-local`).
+2. Copy affected `.jar` + `.pom` files from R1's cache:
+   ```bash
+   # For coord "com.google.guava:guava:31.1-jre"
+   GROUP_PATH=$(echo "com.google.guava" | tr '.' '/')
+   jf rt cp \
+     <R1>-cache/$GROUP_PATH/guava/31.1-jre/ \
+     <rescue-local>/$GROUP_PATH/guava/31.1-jre/ \
+     --recursive
+   ```
+3. Add rescue local to virtual V1 alongside R2 with R2 checked first, rescue as fallback.
+
+**Trade-off:** Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing artifacts); treat as frozen and sunset as pins upgrade.
+
+## Diagnosing slow responses
+
+With `-v`, each file gets a timing line:
 
 ```
-[10:15:22]   URL   https://registry.npmjs.org/yargs-parser/-/yargs-parser-21.1.1.tgz
-[10:15:23]   OK    [200]  yargs-parser/-/yargs-parser-21.1.1.tgz
-[10:15:23]            timing: dns=0.012 tls=0.234 ttfb=0.410 total=1.423
+[..]   OK    [200]  ch.qos.logback:logback-classic:1.5.32  (pom=200 jar=200)
+[..]         pom timing: dns=0.005 tls=0.148 ttfb=0.301 total=0.302
+[..]         jar timing: dns=0.005 tls=0.147 ttfb=0.298 total=0.298
 ```
 
-The timing breakdown separates the phases:
+- `dns` / `tls` — sub-second in healthy conditions
+- `ttfb` — Maven Central usually 200-500ms; Sonatype OSS slower; private Nexus varies
+- `total` ≈ `ttfb` for HEAD
 
-- **`dns`** — DNS resolution. Should be milliseconds; if consistently high, your resolver is slow or the upstream domain has unusual DNS behavior.
-- **`tls`** — TCP + TLS handshake completion. Typically 100–300ms; if higher, the network path to the upstream is slow.
-- **`ttfb`** — time to first byte. This is when the upstream started responding. High values here mean the upstream server itself is slow.
-- **`total`** — end-to-end time for the whole HEAD (including redirects if `-L` follows any).
-
-Use this when a run is unexpectedly slow — the phase breakdown tells you whether to blame DNS, network path, or the upstream server.
+Python's verbose format is coarser: `elapsed=X total=Y` since `requests` doesn't expose all curl phase timers.
 
 ## Troubleshooting
 
-**`ERROR: could not read upstream URL for <repo>`**
-The source repo doesn't exist, isn't a remote type, or the token doesn't have read access to its config. Verify with:
+**All checks return 401 or 403** — upstream requires auth. Maven Central is anonymous-read; this only happens against private mirrors. Check R1's config:
 ```bash
-jf rt curl -X GET "/api/repositories/<repo>" --server-id <id> | jq '.rclass, .url'
+jf rt curl "/api/repositories/<sourceRepo>" --server-id <id> \
+  | jq '{key, rclass, url, username}'
 ```
 
-**All statuses come back as `FAIL`**
-Direct upstream access is blocked from your host. Test manually:
+**A check returns 200 but the same coord failed prepopulate** — file exists upstream but has a subtle issue. Rare for Maven; if it happens, share the coord and response.
+
+**Redirects to unexpected hosts** — Maven Central redirects to its CDN, which is normal (`-L` follows). If you see redirects to a corporate proxy landing page, your network is intercepting outbound HTTPS. `--via-r1` isn't implemented for Maven since Maven traffic isn't commonly proxied — ask if you need it.
+
+**Everything returns FAIL** — network path broken. Manual test:
 ```bash
-curl -sSLI https://registry.npmjs.org/yargs-parser/-/yargs-parser-21.1.1.tgz
+curl -sSLI -o /dev/null -w "http=%{http_code}\n" \
+  https://repo.maven.apache.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar
 ```
-If that fails too, the issue is network egress, not the script. Try running from a host with direct upstream access, or set `HTTPS_PROXY`.
+Expected: `http=200`. If not, network path is the issue.
 
-**Script runs much slower than a manual curl to the same URL**
-Run with `-v` and check the timing breakdown per artifact. A common cause is Windows-style line endings in a hand-edited input file (the script now strips these automatically, but pre-strip your file if unsure):
-```bash
-tr -d '\r' < artifacts.txt > artifacts-clean.txt
-```
-
-**`AUTH` on artifacts that were previously accessible**
-The upstream may have moved a package behind auth (e.g. npm private packages that were previously public). Rare, but worth checking the specific package on the upstream's website.
-
-**Docker repos**
-Not currently supported. Docker's upstream check needs manifest-level probing against the registry's API (`/v2/<name>/manifests/<tag>`), not simple HEAD to a URL. If needed, we can add a `--packageType docker` mode.
+**BOMs showing as `MISS [404]` with `jar=404 pom=200`** — old script that didn't respect `:pom` suffix. Current version skips `.jar` HEAD for POM-only coords.
 
 ## Related
 
-- **[prepopulate-r2.sh (README.md)](./README.md)** — companion script that warms R2 with the still-available artifacts.
-
+- [`prepopulate-r2-maven.md`](./prepopulate-r2-maven.md) — companion prepopulate script
+- [`README.md`](./README.md) — Maven folder overview and quick-start
+- [`python/README.md`](./python/README.md) — Python-specific setup and concurrency notes
+- [`../README.md`](../README.md) — top-level index of all package types

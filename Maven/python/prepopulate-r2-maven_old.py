@@ -16,9 +16,6 @@ Two subcommands:
 import argparse
 import re
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
 import requests
@@ -62,8 +59,6 @@ def parse_args() -> argparse.Namespace:
     p_prep.add_argument("--dry-run", action="store_true", dest="dry_run")
     p_prep.add_argument("--connect-timeout", type=float, default=10.0,
                         dest="connect_timeout")
-    p_prep.add_argument("--concurrency", type=int, default=8,
-                        help="Number of concurrent HEAD requests (default 8)")
     p_prep.add_argument("--verbose", "-v", action="store_true")
 
     return p.parse_args()
@@ -171,13 +166,10 @@ def cmd_list(args: argparse.Namespace) -> None:
 def prepopulate_one(coord: str, target_repo: str, jf_cfg: JFConfig,
                     with_metadata: bool, dry_run: bool, timeout: float,
                     verbose: bool, session: requests.Session,
-                    writer: ReportWriter,
-                    io_lock: threading.Lock, progress: dict, total: int) -> None:
-    """Thread-safe: network I/O happens outside io_lock; log() + writer.row() are locked."""
+                    writer: ReportWriter) -> None:
     jar_path, pom_path, meta_path, is_pom_only = coord_to_files(coord)
     if not pom_path:
-        with io_lock:
-            log(f"  ?     [---]  {coord}  (unparseable coord)")
+        log(f"  ?     [---]  {coord}  (unparseable coord)")
         return
 
     files_to_head: List[Tuple[str, str]] = [("pom", pom_path)]
@@ -189,33 +181,37 @@ def prepopulate_one(coord: str, target_repo: str, jf_cfg: JFConfig,
     display = f"{coord} (POM-only)" if is_pom_only else coord
 
     if dry_run:
-        with io_lock:
-            progress["done"] += 1
-            for _, path in files_to_head:
-                log(f"  DRY   HEAD {jf_cfg.url}/{target_repo}/{path}")
-            for artifact_type, _ in files_to_head:
-                writer.row({"coord": coord, "artifact_type": artifact_type, "http_status": "DRY"})
+        for _, path in files_to_head:
+            log(f"  DRY   HEAD {jf_cfg.url}/{target_repo}/{path}")
+        for artifact_type, _ in files_to_head:
+            writer.row({"coord": coord, "artifact_type": artifact_type, "http_status": "DRY"})
         return
 
-    # Network I/O outside the lock (parallelism happens here)
     overall = "200"
     status_bits = []
-    per_file: List[Tuple[str, str, str]] = []  # (type, status, timing)
     for artifact_type, rel_path in files_to_head:
         url = f"{jf_cfg.url}/{target_repo}/{rel_path}"
         result = head_with_timing(
-            url, headers=jf_cfg.auth_headers, auth=jf_cfg.basic_auth,
-            timeout=timeout, verbose=verbose, session=session,
+            url,
+            headers=jf_cfg.auth_headers,
+            auth=jf_cfg.basic_auth,
+            timeout=timeout,
+            verbose=verbose,
+            session=session,
         )
         status = result.status
         status_bits.append(f"{artifact_type}={status}")
+
         if status == "000":
             overall = "FAIL"
         elif status == "403" and overall not in ("FAIL",):
             overall = "403"
         elif status == "404" and overall == "200":
             overall = "404"
-        per_file.append((artifact_type, status, result.timing_detail))
+
+        writer.row({"coord": coord, "artifact_type": artifact_type, "http_status": status})
+        if verbose and result.timing_detail:
+            log(f"         {artifact_type} {status}: {result.timing_detail}")
 
     status_line = " ".join(status_bits)
     labels = {
@@ -224,16 +220,7 @@ def prepopulate_one(coord: str, target_repo: str, jf_cfg: JFConfig,
         "404":  f"MISS  [404]  {display}  ({status_line})  (not in upstream)",
         "FAIL": f"FAIL  [---]  {display}  ({status_line})",
     }
-    label = labels.get(overall, f'?     [{overall}]  {display}  ({status_line})')
-
-    with io_lock:
-        progress["done"] += 1
-        counter = f"[{progress['done']}/{total}]"
-        log(f"  {counter}  {label}")
-        for artifact_type, status, timing in per_file:
-            writer.row({"coord": coord, "artifact_type": artifact_type, "http_status": status})
-            if verbose and timing:
-                log(f"         {artifact_type} {status}: {timing}")
+    log(f"  {labels.get(overall, f'?     [{overall}]  {display}  ({status_line})')}")
 
 
 def cmd_prepopulate(args: argparse.Namespace) -> None:
@@ -266,43 +253,24 @@ def cmd_prepopulate(args: argparse.Namespace) -> None:
         log("DRY RUN - no requests will hit R2")
 
     meta_suffix = " + maven-metadata.xml" if args.withMetadata else ""
-    log(f"Pre-populating {args.targetRepo} via HEAD (.jar + .pom{meta_suffix}) "
-        f"with concurrency={args.concurrency}...")
-    t_start = time.perf_counter()
+    log(f"Pre-populating {args.targetRepo} via HEAD (.jar + .pom{meta_suffix})...")
 
     report_csv = f"maven-prepop-report-{args.targetRepo}-{timestamp_slug()}.csv"
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=args.concurrency,
-        pool_maxsize=args.concurrency,
-        max_retries=0,
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    io_lock = threading.Lock()
-    progress = {"done": 0}
-    total = len(coords)
 
     with ReportWriter(report_csv, ["coord", "artifact_type", "http_status"]) as writer:
-        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            futures = {
-                executor.submit(
-                    prepopulate_one, coord, args.targetRepo, jf_cfg,
-                    args.withMetadata, args.dry_run, args.connect_timeout,
-                    args.verbose, session, writer, io_lock, progress, total,
-                ): coord for coord in coords
-            }
-            for future in as_completed(futures):
-                coord = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    with io_lock:
-                        log(f"  FAIL  [---]  {coord}  (worker exception: {e})")
+        for coord in coords:
+            prepopulate_one(
+                coord, args.targetRepo, jf_cfg,
+                with_metadata=args.withMetadata,
+                dry_run=args.dry_run,
+                timeout=args.connect_timeout,
+                verbose=args.verbose,
+                session=session,
+                writer=writer,
+            )
 
-    elapsed = time.perf_counter() - t_start
-    log(f"Complete. {len(coords)} coordinates processed in {elapsed:.1f}s. Report: {report_csv}")
+    log(f"Complete. {len(coords)} coordinates processed. Report: {report_csv}")
 
     log("Summary (by artifact_type + status):")
     import csv as _csv

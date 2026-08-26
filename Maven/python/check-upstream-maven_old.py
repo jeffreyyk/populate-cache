@@ -20,9 +20,6 @@ Coordinate format (matches prepopulate-r2-maven output):
 import argparse
 import re
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
 import requests
@@ -47,9 +44,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--createdWithin", help="AQL filter on created (e.g. 1y)")
     p.add_argument("--connect-timeout", type=float, default=10.0,
                    dest="connect_timeout", help="TCP+TLS connect timeout (default 10s)")
-    p.add_argument("--concurrency", type=int, default=8,
-                   help="Number of concurrent HEAD requests (default 8). Increase for "
-                        "faster scans; watch for upstream rate limits.")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print per-file curl phase timing")
     return p.parse_args()
@@ -157,26 +151,18 @@ def coord_to_files(coord: str) -> List[Tuple[str, str]]:
 
 
 def check_one(coord: str, upstream_base: str, timeout: float, verbose: bool,
-              session: requests.Session, writer: ReportWriter,
-              io_lock: threading.Lock, progress: dict, total: int) -> str:
-    """
-    HEAD each expected file for the coord. Return the rolled-up overall status.
-    Thread-safe: all log() and writer.row() calls are guarded by io_lock so
-    output stays coherent under concurrent execution.
-    """
+              session: requests.Session, writer: ReportWriter) -> str:
+    """HEAD each expected file for the coord. Return the rolled-up overall status."""
     is_pom_only = coord.endswith(":pom")
     display = f"{coord} (POM-only)" if is_pom_only else coord
 
     files = coord_to_files(coord)
     if not files:
-        with io_lock:
-            log(f"  ?     [---]  {coord}  (unparseable coord)")
+        log(f"  ?     [---]  {coord}  (unparseable coord)")
         return "PARSE"
 
-    # Do all the network I/O outside the lock — that's the whole point of concurrency.
     overall = "200"
     status_bits = []
-    per_file_results: List[Tuple[str, str, str]] = []  # (type, status, timing_detail)
     for artifact_type, rel_path in files:
         url = f"{upstream_base}/{rel_path}"
         result = head_with_timing(url, timeout=timeout, verbose=verbose, session=session)
@@ -189,7 +175,14 @@ def check_one(coord: str, upstream_base: str, timeout: float, verbose: bool,
             overall = "AUTH"
         elif status == "404" and overall in ("200", "AUTH"):
             overall = "404"
-        per_file_results.append((artifact_type, status, result.timing_detail))
+
+        writer.row({
+            "coord": coord,
+            "artifact_type": artifact_type,
+            "upstream_status": status,
+        })
+        if verbose and result.timing_detail:
+            log(f"         {artifact_type} timing: {result.timing_detail}")
 
     status_line = " ".join(status_bits)
     label_map = {
@@ -198,21 +191,7 @@ def check_one(coord: str, upstream_base: str, timeout: float, verbose: bool,
         "404":  f"MISS  [404]  {display}  ({status_line})  (missing from upstream)",
         "FAIL": f"FAIL  [---]  {display}  ({status_line})",
     }
-    label = label_map.get(overall, f'?     [{overall}]  {display}  ({status_line})')
-
-    # Now serialize the I/O — log line, CSV writes, progress counter — under the lock.
-    with io_lock:
-        progress["done"] += 1
-        counter = f"[{progress['done']}/{total}]"
-        log(f"  {counter}  {label}")
-        for artifact_type, status, timing in per_file_results:
-            writer.row({
-                "coord": coord,
-                "artifact_type": artifact_type,
-                "upstream_status": status,
-            })
-            if verbose and timing:
-                log(f"         {artifact_type} timing: {timing}")
+    log(f"  {label_map.get(overall, f'?     [{overall}]  {display}  ({status_line})')}")
     return overall
 
 
@@ -243,52 +222,27 @@ def main() -> None:
                 f.write(c + "\n")
         log(f"Found {len(coords)} Maven coordinates. List: {intermediate}")
 
-    log(f"Checking coordinates with concurrency={args.concurrency}...")
-    t_start = time.perf_counter()
+    log("Checking coordinates...")
 
     report_csv = f"upstream-check-maven-{args.sourceRepo}-{timestamp_slug()}.csv"
     missing_txt = f"upstream-missing-maven-{args.sourceRepo}-{timestamp_slug()}.txt"
 
     session = requests.Session()
-    # A connection-pool of workers benefits from adapter tuning too so we
-    # don't bottleneck on the default 10-conn pool.
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=args.concurrency,
-        pool_maxsize=args.concurrency,
-        max_retries=0,
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
     missing_coords: List[str] = []
-    missing_lock = threading.Lock()
-    io_lock = threading.Lock()
-    progress = {"done": 0}
-    total = len(coords)
 
     with ReportWriter(report_csv, ["coord", "artifact_type", "upstream_status"]) as writer:
-        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-            futures = {
-                executor.submit(
-                    check_one, coord, upstream_base,
-                    args.connect_timeout, args.verbose,
-                    session, writer, io_lock, progress, total,
-                ): coord
-                for coord in coords
-            }
-            for future in as_completed(futures):
-                coord = futures[future]
-                try:
-                    overall = future.result()
-                    if overall == "404":
-                        with missing_lock:
-                            missing_coords.append(coord)
-                except Exception as e:
-                    with io_lock:
-                        log(f"  FAIL  [---]  {coord}  (worker exception: {e})")
+        for coord in coords:
+            overall = check_one(
+                coord, upstream_base,
+                timeout=args.connect_timeout,
+                verbose=args.verbose,
+                session=session,
+                writer=writer,
+            )
+            if overall == "404":
+                missing_coords.append(coord)
 
-    elapsed = time.perf_counter() - t_start
-    log(f"Complete. {len(coords)} coordinates checked in {elapsed:.1f}s. Report: {report_csv}")
+    log(f"Complete. {len(coords)} coordinates checked. Report: {report_csv}")
 
     # Per-file breakdown summary
     log("Summary (by artifact_type + status):")
