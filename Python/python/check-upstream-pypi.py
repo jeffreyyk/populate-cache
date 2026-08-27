@@ -20,11 +20,12 @@ only needs one status; the label difference is only for humans.
 import argparse
 import json
 import re
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -48,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--createdWithin", help="AQL filter (e.g. 1y)")
     p.add_argument("--via-r1", action="store_true", dest="via_r1",
                    help="Route through tenant's PyPI API (Zscaler workaround)")
+    p.add_argument("--rescueLocal", dest="rescueLocal", default="",
+                   help="Local repo to copy missing artifacts into (from R1 cache). "
+                        "When set, each MISS triggers a jf rt cp from <sourceRepo>-cache "
+                        "to <rescueLocal> preserving the same repo path. Rescue local "
+                        "must exist and be a local repo of matching package type.")
     p.add_argument("--connect-timeout", type=float, default=10.0,
                    dest="connect_timeout")
     p.add_argument("--concurrency", type=int, default=8,
@@ -131,14 +137,79 @@ def normalize_pkg_name(name: str) -> str:
     return _NORMALIZE_RE.sub("-", name.lower())
 
 
+def rescue_from_r1_pypi(pkg: str, version: str, source_repo: str,
+                        rescue_local: str, serverid: str) -> Tuple[int, int, str]:
+    """
+    Copy all cached artifacts for pkg==version from R1's cache to the rescue local.
+
+    Returns (matched, copied, error_message). error_message is empty on success.
+      matched  = number of files found in R1 cache
+      copied   = number of files successfully copied
+    """
+    norm_pkg = normalize_pkg_name(pkg)
+    src_repo_cache = f"{source_repo}-cache"
+
+    # AQL: find files in R1 cache for this coord. Match on normalized pkg
+    # directory (which is how Artifactory stores PyPI artifacts) and on
+    # filenames that pin the version. Include wheels + sdists.
+    aql = {
+        "$and": [
+            {"repo": src_repo_cache},
+            {"path": norm_pkg},
+            {"$or": [
+                {"name": {"$match": f"{norm_pkg}-{version}-*.whl"}},
+                {"name": f"{norm_pkg}-{version}.tar.gz"},
+                {"name": f"{norm_pkg}-{version}.zip"},
+            ]},
+        ]
+    }
+    spec = {"files": [{"aql": {"items.find": aql}}]}
+
+    try:
+        matches = run_aql_spec_search(spec, serverid)
+    except Exception as e:
+        return (0, 0, f"AQL failed: {str(e)[:80]}")
+
+    if not matches:
+        return (0, 0, "no matches in R1 cache")
+
+    copied = 0
+    last_err = ""
+    for entry in matches:
+        src = f"{entry['repo']}/{entry['path']}/{entry['name']}"
+        dst = f"{rescue_local}/{entry['path']}/{entry['name']}"
+        result = subprocess.run(
+            ["jf", "rt", "cp", src, dst, f"--server-id={serverid}", "--flat=true"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if result.returncode == 0 and "success" in (result.stdout + result.stderr).lower():
+            copied += 1
+        elif result.returncode == 0:
+            # jf rt cp exits 0 even on no-op; check stdout for actual result
+            if "0" not in result.stdout or "succeeded" in result.stdout.lower():
+                copied += 1
+            else:
+                last_err = (result.stdout + result.stderr).splitlines()[-1][:80]
+        else:
+            last_err = (result.stderr or result.stdout).strip().splitlines()[-1][:80] if (result.stderr or result.stdout).strip() else "unknown error"
+
+    return (len(matches), copied, last_err if copied < len(matches) else "")
+
+
 def check_one(pkgver: str, upstream_base: str, jf_cfg: JFConfig,
               via_r1: bool, sourceRepo: str, timeout: float,
               verbose: bool, session: requests.Session,
               writer: ReportWriter,
-              io_lock: threading.Lock, progress: dict, total: int) -> str:
+              io_lock: threading.Lock, progress: dict, total: int,
+              rescue_local: str = "", serverid: str = "",
+              rescue_stats: Optional[dict] = None) -> str:
     """
     GET simple index for pkg; check response body for version filename prefix.
     Returns CSV status code (200/404/401/000).
+
+    If rescue_local is set and status is 404 (missing), immediately copy
+    matching artifacts from R1 cache to the rescue local. Results counted
+    in rescue_stats (thread-safe via io_lock updates).
     """
     pkg, _, version = pkgver.partition("==")
     norm_pkg = normalize_pkg_name(pkg)
@@ -189,10 +260,37 @@ def check_one(pkgver: str, upstream_base: str, jf_cfg: JFConfig,
         label = f"?     [{status}]  {pkgver}"
         csv_status = status
 
+    # Rescue-copy from R1 cache if MISS and rescue_local set.
+    # Runs outside io_lock (subprocess I/O) so multiple rescues can happen in parallel.
+    rescue_line = ""
+    if csv_status == "404" and rescue_local:
+        matched, copied, err = rescue_from_r1_pypi(
+            pkg, version, sourceRepo, rescue_local, serverid
+        )
+        if matched == 0:
+            rescue_line = f"RESCUE: nothing found in {sourceRepo}-cache to copy"
+            if rescue_stats is not None:
+                with io_lock:
+                    rescue_stats["nomatch"] += 1
+        elif copied == matched:
+            rescue_line = f"RESCUE: copied {copied} file(s) to {rescue_local}"
+            if rescue_stats is not None:
+                with io_lock:
+                    rescue_stats["rescued"] += 1
+                    rescue_stats["files_copied"] += copied
+        else:
+            rescue_line = f"RESCUE: PARTIAL {copied}/{matched} files copied (last err: {err})"
+            if rescue_stats is not None:
+                with io_lock:
+                    rescue_stats["partial"] += 1
+                    rescue_stats["files_copied"] += copied
+
     with io_lock:
         progress["done"] += 1
         counter = f"[{progress['done']}/{total}]"
         log(f"  {counter}  {label}")
+        if rescue_line:
+            log(f"         → {rescue_line}")
         if verbose:
             log(f"         timing: elapsed={elapsed:.3f} total={total_time:.3f}")
         writer.row({"pkg": pkg, "version": version, "upstream_status": csv_status})
@@ -206,6 +304,29 @@ def main() -> None:
 
     verify_serverid(args.serverid)
     jf_cfg = get_jf_config(args.serverid)
+
+    # Preflight the rescue local if requested
+    if args.rescueLocal:
+        rc, out, _ = run_jf(
+            ["rt", "curl", "-X", "GET", f"/api/repositories/{args.rescueLocal}",
+             f"--server-id={args.serverid}"],
+            check=False,
+        )
+        if rc != 0 or not out.strip():
+            die(f"rescue local '{args.rescueLocal}' does not exist. Create it first "
+                f"(as a local repo of PyPI package type) then re-run.")
+        try:
+            repo_data = json.loads(out)
+        except json.JSONDecodeError:
+            die(f"could not parse repo config for '{args.rescueLocal}'")
+        rclass = repo_data.get("rclass", "").lower()
+        if rclass != "local":
+            die(f"'{args.rescueLocal}' is a '{rclass}' repo, must be 'local' for rescue")
+        pkg_type = repo_data.get("packageType", "").lower()
+        if pkg_type not in ("pypi", ""):
+            log(f"WARN: rescue local packageType is '{pkg_type}', expected 'pypi'. "
+                f"Copies may work but resolution might not.")
+        log(f"Rescue local: {args.rescueLocal} (local/{pkg_type or 'unknown'})")
 
     if args.via_r1:
         upstream_url = ""
@@ -246,6 +367,7 @@ def main() -> None:
     total = len(coords)
     missing: List[str] = []
     missing_lock = threading.Lock()
+    rescue_stats = {"rescued": 0, "partial": 0, "nomatch": 0, "files_copied": 0}
 
     with ReportWriter(report_csv, ["pkg", "version", "upstream_status"]) as writer:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -254,6 +376,7 @@ def main() -> None:
                     check_one, coord, upstream_url, jf_cfg, args.via_r1,
                     args.sourceRepo, args.connect_timeout, args.verbose,
                     session, writer, io_lock, progress, total,
+                    args.rescueLocal, args.serverid, rescue_stats,
                 ): coord for coord in coords
             }
             for future in as_completed(futures):
@@ -286,7 +409,17 @@ def main() -> None:
             for m in sorted(set(missing)):
                 f.write(m + "\n")
         log(f"{len(set(missing))} pkg==version missing from upstream: {missing_txt}")
-        log("Feed this file into the rescue-local remediation step.")
+        if args.rescueLocal:
+            log("Rescue summary:")
+            log(f"  fully rescued  : {rescue_stats['rescued']} coord(s)")
+            log(f"  partially      : {rescue_stats['partial']} coord(s)")
+            log(f"  no cache match : {rescue_stats['nomatch']} coord(s) (nothing in R1 cache to copy)")
+            log(f"  total files    : {rescue_stats['files_copied']} copied to {args.rescueLocal}")
+            log("Verify:")
+            log(f"  jf rt search '{args.rescueLocal}/*' --server-id {args.serverid} | jq 'length'")
+        else:
+            log("Feed the missing.txt file into the rescue-local remediation step,")
+            log("OR re-run with --rescueLocal <repo> to automate the copy.")
     else:
         log("No missing packages detected. Nothing to remediate.")
 

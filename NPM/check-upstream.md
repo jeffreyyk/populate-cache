@@ -54,16 +54,34 @@ cd python/
 python3 check-upstream.py \
   --serverid psblr --sourceRepo sum-cba-npm-remote \
   --downloadedWithin 1y --concurrency 8
+
+# With --via-r1 for Zscaler-restricted environments
+python3 check-upstream.py \
+  --serverid psblr --sourceRepo sum-cba-npm-remote \
+  --fromFile npm-artifacts-*.txt --concurrency 8 --via-r1
+
+# With auto-rescue: missing tarballs get copied to a local repo
+python3 check-upstream.py \
+  --serverid psblr --sourceRepo sum-cba-npm-remote \
+  --fromFile npm-artifacts-*.txt --concurrency 8 \
+  --rescueLocal sum-cba-npm-rescue-local
 ```
 
 ## Flags
 
 ```
 --serverid <id>             JFrog CLI server ID
---sourceRepo <repo>         R1 npm remote (only used to read upstream URL)
---fromFile <path>           Read artifact-path list from file (mutually exclusive with time filters)
+--sourceRepo <repo>         R1 npm remote (used for upstream URL and rescue source)
+--fromFile <path>           Read list from file (mutually exclusive with time filters).
+                            Accepts BOTH pkg@version and artifact-path formats.
 --downloadedWithin <dur>    AQL filter on stat.downloaded (e.g. 1y, 6mo)
 --createdWithin <dur>       Additional AQL filter on created
+--via-r1                    Route HEAD through tenant's npm API instead of upstream.
+                            Use when corporate proxies (Zscaler etc.) block direct
+                            registry.npmjs.org from the client.
+--rescueLocal <repo>        Python only: on MISS, jf rt cp the .tgz from R1's cache
+                            to this local repo. Repo must exist and be a local repo
+                            of npm package type.
 --connect-timeout <sec>     TCP+TLS connect timeout (default 10s)
 --verbose, -v               Per-file phase timing
 --concurrency N             Python only: parallel HEAD workers (default 8)
@@ -71,7 +89,7 @@ python3 check-upstream.py \
 
 Duration format: `1d`, `1w`, `6mo`, `1y`.
 
-Input file format: one artifact path per line (like `eslint/-/eslint-8.57.0.tgz`). Lines starting with `#` and blank lines are ignored. Trailing `\r` is stripped automatically.
+Input file format: one entry per line, either `pkg@version` (from prepop's `list` output) or artifact path (from AQL). Python auto-converts both to the tarball URL. Lines starting with `#` and blank lines are ignored. Trailing `\r` is stripped automatically.
 
 ## Artifact path format
 
@@ -124,10 +142,47 @@ Progress counter `[X/N]` appears on each result line; elapsed time at completion
 
 ## Rescue-local remediation
 
-For paths flagged 404:
+For paths flagged 404 — two paths, automated or manual.
 
-1. Create an npm rescue local repo (e.g. `<prefix>-npm-rescue-local`).
-2. Copy affected `.tgz` files from R1's cache — the artifact path in R1's cache matches the missing.txt line exactly:
+### Automated (Python only, recommended)
+
+Pass `--rescueLocal <local-repo>` and the script copies missing tarballs automatically as they're detected. For each MISS, the worker runs `jf rt cp` on the single `.tgz` from R1's cache to the same path in the rescue local.
+
+**Setup once** — create the rescue local (Local, npm package type):
+
+```bash
+jf rt curl -X PUT "/api/repositories/sum-cba-npm-rescue-local" --server-id psblr \
+  -H "Content-Type: application/json" \
+  -d '{"key":"sum-cba-npm-rescue-local","rclass":"local","packageType":"npm"}'
+```
+
+**Run with rescue:**
+
+```bash
+python3 check-upstream.py \
+  --serverid psblr --sourceRepo sum-cba-npm-remote \
+  --fromFile npm-artifacts-*.txt --concurrency 8 \
+  --rescueLocal sum-cba-npm-rescue-local
+```
+
+Preflight validates: repo exists, is `rclass: local`, packageType matches (warn only).
+
+Summary at end:
+```
+Rescue summary:
+  fully rescued  : 6 coord(s)
+  failed to copy : 0 coord(s)
+  no cache match : 2 coord(s) (nothing in R1 cache to copy)
+Verify:
+  jf rt search 'sum-cba-npm-rescue-local/*' --server-id psblr | jq 'length'
+```
+
+### Manual (bash, or when you want granular control)
+
+For paths flagged 404 that you want to copy yourself:
+
+1. Create an npm rescue local repo (as above).
+2. Copy affected `.tgz` files from R1's cache — the path matches the missing.txt line exactly:
    ```bash
    # For "eslint/-/eslint-8.57.0.tgz"
    jf rt cp \
@@ -141,7 +196,9 @@ For paths flagged 404:
    ```
 3. Add rescue local to virtual V1 alongside R2 with R2 checked first, rescue as fallback.
 
-**Trade-off:** Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing tarballs); treat as frozen and sunset as pins upgrade.
+### Trade-offs
+
+Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing tarballs); treat as frozen and sunset as pins upgrade.
 
 ## Diagnosing slow responses
 

@@ -64,19 +64,28 @@ python3 check-upstream-pypi.py \
 python3 check-upstream-pypi.py \
   --serverid psblr --sourceRepo sum-cba-pypi-remote \
   --fromFile pypi-artifacts-*.txt --concurrency 8 --via-r1
+
+# With auto-rescue: missing packages get copied to a local repo
+python3 check-upstream-pypi.py \
+  --serverid psblr --sourceRepo sum-cba-pypi-remote \
+  --fromFile pypi-artifacts-*.txt --concurrency 8 --via-r1 \
+  --rescueLocal sum-cba-pypi-rescue-local
 ```
 
 ## Flags
 
 ```
 --serverid <id>             JFrog CLI server ID
---sourceRepo <repo>         R1 PyPI remote (only used to read upstream URL)
+--sourceRepo <repo>         R1 PyPI remote (used for upstream URL and rescue source)
 --fromFile <path>           Read pkg==version list from file (mutually exclusive with time filters)
 --downloadedWithin <dur>    AQL filter on stat.downloaded (e.g. 1y, 6mo)
 --createdWithin <dur>       Additional AQL filter on created
 --via-r1                    Route GET through R1's own /api/pypi/ endpoint on the tenant
                             instead of hitting upstream directly. Use when corporate
                             proxies (Zscaler etc.) block pypi.org from the client.
+--rescueLocal <repo>        Python only: on MISS, jf rt cp all matching wheels/sdists
+                            from R1's cache to this local repo. Repo must exist and
+                            be a local repo of PyPI package type.
 --connect-timeout <sec>     TCP+TLS connect timeout (default 10s)
 --verbose, -v               Per-file phase timing
 --concurrency N             Python only: parallel GET workers (default 8)
@@ -159,9 +168,51 @@ In Zscaler-restricted enterprise environments, direct traffic from client machin
 
 ## Rescue-local remediation
 
-For entries flagged missing:
+For entries flagged missing — two paths, automated or manual.
 
-1. Create a PyPI rescue local repo (e.g. `<prefix>-pypi-rescue-local`).
+### Automated (Python only, recommended)
+
+Pass `--rescueLocal <local-repo>` and the script copies missing artifacts automatically as they're detected. For each MISS, an AQL search finds all matching files in R1's cache (wheels for all platforms + sdist), then `jf rt cp` copies each to the same path in the rescue local.
+
+**Setup once** — create the rescue local (Local, PyPI package type):
+
+```bash
+jf rt curl -X PUT "/api/repositories/sum-cba-pypi-rescue-local" --server-id psblr \
+  -H "Content-Type: application/json" \
+  -d '{"key":"sum-cba-pypi-rescue-local","rclass":"local","packageType":"pypi"}'
+```
+
+**Run with rescue:**
+
+```bash
+python3 check-upstream-pypi.py \
+  --serverid psblr --sourceRepo sum-cba-pypi-remote \
+  --fromFile pypi-artifacts-*.txt --concurrency 8 --via-r1 \
+  --rescueLocal sum-cba-pypi-rescue-local
+```
+
+Preflight validates: repo exists, is `rclass: local`, packageType matches (warn only).
+
+Summary at end:
+```
+Rescue summary:
+  fully rescued  : 6 coord(s)
+  partially      : 0 coord(s)
+  no cache match : 2 coord(s) (nothing in R1 cache to copy)
+  total files    : 15 copied to sum-cba-pypi-rescue-local
+Verify:
+  jf rt search 'sum-cba-pypi-rescue-local/*' --server-id psblr | jq 'length'
+```
+
+- **fully rescued** — all matching R1 cache files copied
+- **partially** — some files copied, others failed (check per-line `RESCUE: PARTIAL n/m` entries)
+- **no cache match** — missing from upstream AND nothing in R1 cache to rescue = truly gone
+
+### Manual (bash, or when you want granular control)
+
+For entries flagged missing that you want to copy yourself:
+
+1. Create a PyPI rescue local repo (as above).
 2. Copy affected artifacts from R1's cache. PyPI cache layout in Artifactory is `<pkg>/<filename>`:
    ```bash
    # For "requests==2.31.0"
@@ -178,7 +229,9 @@ For entries flagged missing:
    ```
 3. Add rescue local to virtual V1 alongside R2 with R2 checked first, rescue as fallback.
 
-**Trade-off:** Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing versions); treat as frozen and sunset as pins upgrade.
+### Trade-offs
+
+Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing versions); treat as frozen and sunset as pins upgrade.
 
 ## Diagnosing slow responses
 

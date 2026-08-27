@@ -50,6 +50,17 @@ cd python/
 python3 check-upstream-maven.py \
   --serverid psblr --sourceRepo sum-cba-maven-remote \
   --fromFile maven-artifacts-*.txt --concurrency 8
+
+# With --via-r1 for corporate-proxy environments (Zscaler)
+python3 check-upstream-maven.py \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt --concurrency 8 --via-r1
+
+# With auto-rescue: missing artifacts get copied to a local repo
+python3 check-upstream-maven.py \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt --concurrency 8 \
+  --rescueLocal sum-cba-maven-rescue-local
 ```
 
 ## Flags
@@ -60,6 +71,12 @@ python3 check-upstream-maven.py \
 --fromFile <path>           Read coord list from file (mutually exclusive with time filters)
 --downloadedWithin <dur>    AQL filter on stat.downloaded (e.g. 1y, 6mo)
 --createdWithin <dur>       Additional AQL filter on created
+--via-r1                    Route HEAD through R1's own repo endpoint on the tenant
+                            instead of hitting upstream directly. Use when corporate
+                            proxies (Zscaler etc.) block direct Maven Central.
+--rescueLocal <repo>        Python only: on MISS, jf rt cp the version dir from
+                            R1's cache to this local repo. Repo must exist and be
+                            a local repo of Maven package type.
 --connect-timeout <sec>     TCP+TLS connect timeout (default 10s)
 --verbose, -v               Per-file phase timing
 --concurrency N             Python only: parallel HEAD workers (default 8)
@@ -122,9 +139,50 @@ Progress counter `[X/N]` appears on each result line; elapsed time at completion
 
 ## Rescue-local remediation
 
-For coords flagged 404:
+For coords flagged 404 by check-upstream — two paths, automated or manual.
 
-1. Create a Maven rescue local repo (e.g. `<prefix>-maven-rescue-local`).
+### Automated (Python only, recommended)
+
+Pass `--rescueLocal <local-repo>` and the script copies missing artifacts automatically as they're detected. For each MISS, the worker runs `jf rt cp --recursive` on the entire `<groupPath>/<artifactId>/<version>/` directory from R1's cache — capturing jar + pom + optional sources/javadoc + checksums in one operation.
+
+**Setup once** — create the rescue local (Local, Maven package type):
+
+```bash
+jf rt curl -X PUT "/api/repositories/sum-cba-maven-rescue-local" --server-id psblr \
+  -H "Content-Type: application/json" \
+  -d '{"key":"sum-cba-maven-rescue-local","rclass":"local","packageType":"maven"}'
+```
+
+**Run with rescue:**
+
+```bash
+python3 check-upstream-maven.py \
+  --serverid psblr --sourceRepo sum-cba-maven-remote \
+  --fromFile maven-artifacts-*.txt --concurrency 8 \
+  --rescueLocal sum-cba-maven-rescue-local
+```
+
+Preflight validates: repo exists, is `rclass: local`, packageType matches (warn only).
+
+Summary at end:
+```
+Rescue summary:
+  fully rescued  : 8 coord(s)
+  failed to copy : 0 coord(s)
+  no cache match : 2 coord(s) (nothing in R1 cache to copy)
+Verify:
+  jf rt search 'sum-cba-maven-rescue-local/*' --server-id psblr | jq 'length'
+```
+
+- **fully rescued** — files copied; add rescue-local to V1 as fallback
+- **failed to copy** — check per-line `RESCUE: FAILED` log entries
+- **no cache match** — missing upstream AND missing from R1 cache = truly gone
+
+### Manual (bash, or when you want granular control)
+
+For coords flagged 404 that you want to copy yourself:
+
+1. Create a Maven rescue local repo (as above).
 2. Copy affected `.jar` + `.pom` files from R1's cache:
    ```bash
    # For coord "com.google.guava:guava:31.1-jre"
@@ -136,7 +194,9 @@ For coords flagged 404:
    ```
 3. Add rescue local to virtual V1 alongside R2 with R2 checked first, rescue as fallback.
 
-**Trade-off:** Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing artifacts); treat as frozen and sunset as pins upgrade.
+### Trade-offs
+
+Curation only intercepts remotes. Rescue-local artifacts bypass Curation. Compensating: Xray still indexes them; scope discipline (only confirmed-missing coords); treat as frozen and sunset as pins upgrade.
 
 ## Diagnosing slow responses
 
